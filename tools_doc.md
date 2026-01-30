@@ -1,0 +1,4 @@
+- build.bat -> builds the project
+- run_legacy.bat -> takes files from /bin/chunk_X as input outputs them as /output/chunk_X (Less features but works)
+- smart_mov.bat -> Moves a file (any dir, just enter the file name) to any dir (just enter the name of dir, not full path)
+- efind - find anything magicallyy with just the name
